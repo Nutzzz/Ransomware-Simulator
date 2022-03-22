@@ -1,68 +1,159 @@
 ﻿<#
-Powershell ransomware decrypter
+Ransomware-Simulator PowerShell Decrypter
 .Description
-This powershell script decrypt files using an X.509 public key certificate
-It will decrypt the files that are encrypted by the encryption script. It's designed to decrypt files on the lowest drive letter first. This allows you to control what share is being decrypted.
-It is recommended to only have one drive mapped to ensure only one share is decrypted.
+This PowerShell script decrypts files using an X.509 public key certificate.
+It will decrypt the files that are encrypted by the encryption script. It's configured to decrypt files on the lowest drive letter first (e.g. Z:). This allows you to control what share is being decrypted.
+I recommend only having one share mapped to ensure only one share is decrypted.
 .Instructions
-You must have a valid cert. Issue this command to see if you have cert we can use. Get-ChildItem Cert:\CurrentUser\My\
-Copy the thumbprint to line 17 below. It should be the same thumbprint used in the encryption script
+You can copy your certificate's thumbprint to line 26 below, or allow the script to check for a file created by the encryption script.
+
+
+
+
+
 .Notes
+
 Credit to Ryan Ries for developing the decryption and filestream scriptblock.
 http://msdn.microsoft.com/en-us/library/system.security.cryptography.x509certificates.x509certificate2.aspx
 .
 Provided by WatchPoint Data under the MIT license.
 #>
 
-#define the cert to use for decryption
-$Cert = $(Get-ChildItem Cert:\CurrentUser\My\F09CC285277DBAC041935B8D96ABE2C1BF123C46)
 
-#enumerate drives
-$psdrives = get-psdrive | select-object -property Root, DisplayRoot
+# Global variables
 
-#find network drives
-$netdrives = @($psdrives)."DisplayRoot"
+  # The certificate thumbprint to use
+$CERT_THUMB = "THUMBPRINTGOESHERE"
+  # Automatically use the first certificate found
+$CERT_AUTO = $False
+  # Set a file to load the last used cert thumbprint from encrypt script
+$CERT_FILE = "$Env:TEMP\ransom\cert.txt"
 
-#enumerate network drives
-ForEach ($n in $netdrives)
+  # Remove extension from decrypted files
+$RENAME = $True
+  # Set the extension to use
+$RENAME_EXT = ".ransom"
+  # Set a file to load the last used extension from encrypt script
+$RENAME_EXT_FILE = "$Env:TEMP\ransom\ext.txt"
+
+  # Set a file to load the network drives used from encrypt script
+$DRIVES_FILE = "$Env:TEMP\ransom\drives.csv"
+
+  # Use local directory to work on encrypted files
+$USE_LOCAL_DIR = $True
+  # Set the local directory to use
+$LOCAL_DIR = "$Env:TEMP\ransom\work"
+
+
+# Warn if run as admin
+If ([Security.Principal.WindowsIdentity]::GetCurrent().Groups -contains 'S-1-5-32-544')
+{
+    Write-Warning "NOTE: Currently running as Administrator; user network drives won't be found."
+}
+
+# Define the cert to use for decryption
+If (-not [string]::IsNullOrEmpty($CERT_THUMB))
+{
+    $Cert = $(Get-ChildItem $("Cert:\CurrentUser\My\" + $CERT_THUMB) -ErrorAction SilentlyContinue)
+}
+If ($Cert.PrivateKey -eq $Null -or $Cert.HasPrivateKey -eq $False)
+{
+    If (Test-Path -Path "$CERT_FILE" -PathType Leaf)
     {
-    If ($n)
+      # Use cert from encryption script
+        $CERT_THUMB = Get-Content "$CERT_FILE" | Select -First 1
+        $Cert = $(Get-ChildItem $("Cert:\CurrentUser\My\" + $CERT_THUMB) -ErrorAction SilentlyContinue)
+    } ElseIf ($CERT_AUTO -eq 1) {
+        $Cert = $(Get-ChildItem "Cert:\CurrentUser\My\" | Select-Object -First 1)
+    }
+}
+If ($Cert.PrivateKey -eq $Null -or $Cert.HasPrivateKey -eq $False)
+{
+    Write-Error "The supplied certificate does not contain a private key, or it could not be accessed."
+    Exit
+}
+
+If (Test-Path -Path "$DRIVES_FILE" -PathType Leaf)
+{
+  # Use drives from encryption script
+    $netdrives = Import-CSV -Path "$DRIVES_FILE"
+} Else {
+  # Enumerate drives
+    $psdrives = Get-PSDrive
+
+  # Find network drives
+    $netdrives = [System.Collections.Generic.List[PSCustomObject]]::new()
+    foreach ($d in $psdrives)
+    {
+        if ($d.Root -ne $Null -and $d.DisplayRoot -ne $Null)
         {
-        #decrypt files and ignore directories
-        $FileToDecrypt = get-childitem -path $n -Recurse -force | where-object{!($_.PSIsContainter)} | % {$_.FullName} -ErrorAction SilentlyContinue  
-        }
-        Else
-        {
-        Write-Host "File not accessible"
+            $netdrives.Add($d)
         }
     }
+}
 
-#decryption and filestream function
+If (Test-Path -Path "$RENAME_EXT_FILE" -PathType Leaf)
+{
+  # Import rename extension
+    $RENAME = $True
+    $RENAME_EXT = Get-Content "$RENAME_EXT_FILE" | Select -First 1
+    If ([string]::IsNullOrEmpty($RENAME_EXT) -or (-not $RENAME_EXT.StartsWith(".")))
+    {
+        $RENAME = $False
+    }
+}
+
+# Enumerate files on the network drives
+foreach ($n in $netdrives)
+{
+    If ($n)
+    {
+      # Decrypt files and ignore directories
+        $FilesToDecrypt = Get-ChildItem -Path $n.Root -Recurse -Force -ErrorAction SilentlyContinue | Where-Object{!($_.PSIsContainer)} | % {$_.FullName}
+    } Else {
+        Write-Host "File not accessible"
+    }
+}
+
+If ($USE_LOCAL_DIR -eq 1)
+{
+    New-Item -Path "$LOCAL_DIR" -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+}
+
+# Decryption and filestream function
 Function Decrypt-File
 {
-    Param([Parameter(mandatory=$true)][System.IO.FileInfo]$FileToDecrypt,
+    Param([Parameter(mandatory=$true)][string]$FileToDecrypt,
+          [Parameter(mandatory=$true)][string]$FileToWrite,
           [Parameter(mandatory=$true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert)
- 
-    Try { [System.Reflection.Assembly]::LoadWithPartialName("System.Security.Cryptography") }
-    Catch { Write-Error "Could not load required assembly."; Return }
-     
+
+    Try {
+        [System.Reflection.Assembly]::LoadWithPartialName("System.Security.Cryptography")
+    } Catch {
+        Write-Error "Could not load required assembly."
+        Exit
+    }
+
+    If ((Get-Item "$FileToDecrypt").length -lt 256)
+    {
+        Write-Warning "Unable to process files smaller than 256 bytes."
+        Return
+    }
+
     $AesProvider                = New-Object System.Security.Cryptography.AesManaged
     $AesProvider.KeySize        = 256
     $AesProvider.BlockSize      = 128
     $AesProvider.Mode           = [System.Security.Cryptography.CipherMode]::CBC
     [Byte[]]$LenKey             = New-Object Byte[] 4
     [Byte[]]$LenIV              = New-Object Byte[] 4
-    If($Cert.HasPrivateKey -eq $False -or $Cert.PrivateKey -eq $null)
-    {
-        Write-Error "The supplied certificate does not contain a private key, or it could not be accessed."
+
+    Try {
+        $FileStreamReader = New-Object System.IO.FileStream([System.IO.FileInfo]"$FileToDecrypt", [System.IO.FileMode]::Open)
+    } Catch {
+        Write-Warning "Unable to open input file for reading."       
         Return
     }
-    Try { $FileStreamReader = New-Object System.IO.FileStream("$($FileToDecrypt.FullName)", [System.IO.FileMode]::Open) }
-    Catch
-    {
-        Write-Error "Unable to open input file for reading."       
-        Return
-    }  
+
     $FileStreamReader.Seek(0, [System.IO.SeekOrigin]::Begin)         | Out-Null
     $FileStreamReader.Seek(0, [System.IO.SeekOrigin]::Begin)         | Out-Null
     $FileStreamReader.Read($LenKey, 0, 3)                            | Out-Null
@@ -79,39 +170,67 @@ Function Decrypt-File
     $FileStreamReader.Seek(8 + $LKey, [System.IO.SeekOrigin]::Begin) | Out-Null
     $FileStreamReader.Read($IV, 0, $LIV)                             | Out-Null
     [Byte[]]$KeyDecrypted = $Cert.PrivateKey.Decrypt($KeyEncrypted, $false)
-    $Transform = $AesProvider.CreateDecryptor($KeyDecrypted, $IV)
-    Try { $FileStreamWriter = New-Object System.IO.FileStream("$($env:TEMP)\$($FileToDecrypt.Name)", [System.IO.FileMode]::Create) }
-    Catch
+    If ($KeyDecrypted -eq $Null)
     {
-        Write-Error "Unable to open output file for writing.`n$($_.Message)"
+        Write-Warning "Unable to decrypt file."
+        Return
+    }
+    $Transform = $AesProvider.CreateDecryptor($KeyDecrypted, $IV)
+    If ($Transform -eq $Null)
+    {
+        Write-Warning "Unable to decrypt file."
+        Return
+    }
+
+    Try {
+        $FileStreamWriter = New-Object System.IO.FileStream([System.IO.FileInfo]"$FileToWrite", [System.IO.FileMode]::Create)
+    } Catch {
+        Write-Warning "Unable to open output file for writing $($FileToWrite)"
         $FileStreamReader.Close()
         Return
     }
+
     [Int]$Count  = 0
     [Int]$Offset = 0
     [Int]$BlockSizeBytes = $AesProvider.BlockSize / 8
     [Byte[]]$Data = New-Object Byte[] $BlockSizeBytes
     $CryptoStream = New-Object System.Security.Cryptography.CryptoStream($FileStreamWriter, $Transform, [System.Security.Cryptography.CryptoStreamMode]::Write)
-    Do
-    {
+
+    Do {
         $Count   = $FileStreamReader.Read($Data, 0, $BlockSizeBytes)
         $Offset += $Count
         $CryptoStream.Write($Data, 0, $Count)
-    }
-    While ($Count -gt 0)
+    } While ($Count -gt 0)
+
     $CryptoStream.FlushFinalBlock()
     $CryptoStream.Close()
     $FileStreamWriter.Close()
     $FileStreamReader.Close()
-    Copy-Item -Path "$($env:TEMP)\$($FileToDecrypt.Name)" -Destination  $FileToDecrypt.DirectoryName -Force
+
+    If ($USE_LOCAL_DIR -eq 1 -and $(Get-Item "$FileToDecrypt").length -ne 0)
+    {
+        Copy-Item -Path "$FileToWrite" -Destination "$FileToDecrypt" -Force
+    }
 }
 
-#$filesplit
-Write-Output $filesplit
-
-foreach ($file in $FileToDecrypt)
+# Logic to decrypt files
+foreach ($infile in $FilesToDecrypt)
 {
-Write-Host "Decrypting $file"
-Decrypt-File $file $Cert 
+    If ($RENAME -eq 1 -and $([System.IO.Path]::GetExtension($infile)) -eq $RENAME_EXT)
+    {
+        Rename-Item -Path "$infile" -NewName "$([System.IO.Path]::GetFilenameWithoutExtension($infile))"
+        $infile = "$([System.IO.Path]::GetDirectoryName($infile))\$([System.IO.Path]::GetFilenameWithoutExtension($infile))"
+    }
+    If ($USE_LOCAL_DIR)
+    {
+        $outfile = "$LOCAL_DIR\$([System.IO.Path]::GetFileName($infile))"
+    } Else {
+        $outfile = $infile
+    }
+
+    Write-Host "Decrypting $($infile)"
+    Decrypt-File "$infile" "$outfile" $Cert
 }
+
+Write-Host "Decryption complete."
 Exit
